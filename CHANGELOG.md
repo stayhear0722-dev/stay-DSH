@@ -1,0 +1,72 @@
+# Changelog
+
+## 0.0.6 — 2026-08-15
+
+### Added
+- `dsh-lark-channel upgrade` installs the newest CLI and restarts the bot on it, in one command. `start` pins the plugin to the CLI's OWN version, so a globally installed CLI upgraded by re-running `start` alone would silently re-pin the version it already had; `start` and `status` now also mention a newer release when one exists. Through npx there is nothing to install and the command says so instead of pretending.
+- The CLI spells commands back the way you invoked it. Run through `npx` its binary lives in a throwaway cache, so every hint that said `dsh-lark-channel status` was telling half its users to run something that does not exist; usage and every message now print `npx dsh-lark-channel@latest …` for that caller and the bare name for an installed one. Installing globally stays a choice the reader makes, not a machine-wide change the tool makes for them.
+- `/new` starts a fresh session where the conversation already stands. A session id is derived rather than allocated, so nothing varied when someone wanted an empty context without moving: an epoch — stored beside the workspace and model maps, absent meaning zero — now folds into the id, and zero derives exactly the id it always did. It is per (conversation × directory), so starting over in one workspace leaves the thread you would `/cd` back to intact. Nothing is deleted: the previous session stays on disk, and the workspace and model route carry over.
+- Chat agents are told where they woke up, in one sentence: the bot account they speak as, that their reply IS the message, and that answering is optional. Without it an agent read "say hello to the other bot" as an investigation and shelled out to a CLI to send a message its own reply would have sent. A message from another agent carries one more line — the exact `<at user_id="…"></at>` that hands the turn back to THAT agent, or silence to end it — which rides that message rather than every human one. By id rather than by name: names repeat, and a mention resolving to the wrong colleague or to nobody would end an exchange meant to continue.
+- Two bots can talk to each other, by default. A message from a bot used to be dropped outright; bot traffic is now narrowed rather than gated, like every other reach here — `botPeers` restricts it to named ids when a deployment wants that, and empty narrows nothing. What bounds the exchange instead is `botHops`: a conversation may run six consecutive bot-sourced turns before the channel stops and says so in the chat, and a human message refills the budget. Each bot is named once per chat on the operator console, whether it was answered or narrowed out, and a channel never answers its own voice.
+- A second bot can be composed alongside the first. `instance` names a row, and that name keys the three identifiers two rows would otherwise write over each other with: the settings section holding their workspace and model maps, the credential holding their app secret, and the prefix their session ids carry — without which two bots invited to the SAME group derive one session id and share one agent. A row with no name keeps the original identifiers byte for byte, so nothing an existing deployment has stored moves.
+- `/status` reports what the conversation is spending: how full the model's context is (`32.5k / 128k`, with the share of the window) and the whole-session token totals, read from the host's own token-meter projections. Both rows appear only where a deployment composed that meter and the session has actually made a request — a row claiming zero where nothing is measured is a lie an operator acts on.
+
+### Changed
+- The app secret is stored through the host `credentials` seam instead of the user settings document. Onboarding writes the scanned secret to the credential `LARK_APP_SECRET` and keeps only a reference in settings; a secret already sitting in the settings document moves behind that reference on the next boot, so an existing deployment is repaired by restarting rather than by scanning again. A deployment that injects `appSecret` in its composition still owns it, and one with no credentials provider composed keeps working exactly as before.
+
+### Fixed
+- A profile is never pushed back to an older plugin. `start` pinned the profile to the CLI's own version unconditionally, so installing an older CLI and running it downgraded a working bot — and a bot downgraded past the credential migration finds a settings section it cannot read, connects to nothing, and quietly asks to be set up again. Both `start` and `add` now refuse, naming the two versions and the upgrade.
+- `upgrade`, `add`, and `remove` act on the service that is installed rather than on a default. Each read the profile from a constant and the workspace from the current directory, so `upgrade` run in `/tmp` rewrote a `--profile web --workspace /repo` service into `lark` and `/tmp`, and `add` edited a profile nobody was running. The installed unit already records both, so it is read back from there, and an explicit `--profile` / `--workspace` still wins.
+- `add` brings the profile's plugin to the CLI's exact version before writing a row. The row names an `instance`, an option only a new enough plugin has; an older one rejects the whole row and takes the bot down with it — so a new CLI could break a profile it had not updated.
+- A question the model marked `multi_select` can now be answered with more than one option. Its card was built from single-choice controls, so the first press settled a question that may take three answers; it now renders a form whose multi-select submits the chosen set in one action, carrying option positions rather than labels. A submission that names nothing leaves the card live, and typing an answer still works as it does for every other question.
+
+## 0.0.5 — 2026-08-15
+
+### Added
+- Model questions reach the chat as cards. `ask_user_question` is shadowed in each chat agent's own layer — the host's layered tool registry resolves the nearest registration and reserves only `run_code` from shadowing — so the model's options render as buttons and a click answers them; when no option fits, an ordinary reply is the answer and does not start another turn. Cancellation, session release, and a thirty-minute silence all settle the question empty and repaint its card, so a turn is never hung on one. `ask_user_question` accordingly leaves the default `denyTools`.
+- Plan review reaches the chat. `exit_plan_mode` is shadowed per chat agent the same way the question tool is, wherever a plan service exists to leave plan mode afterwards: the plan is sent as an ordinary message so its markdown renders, and the decision follows as a card. Approval calls the plan service's own public switch rather than a copy of its state machine; words typed instead go back to the model as feedback, and a dismissed review tells it to stop and wait rather than present again. `denyTools` is empty by default as a result.
+- `/model` answers with a picker over the advertised routes — the route in use states itself instead of offering a press, and a conversation that left the default gets a way back — while `/model use <provider/model>` and `/model reset` stay exactly as they were, for anyone who already knows the route. `/status` answers with a readout of what the next message will do, and a refresh that re-reads live state rather than repainting a snapshot. Both cards carry the conversation they govern, so a forwarded card governs nothing and a per-sender conversation cannot be switched by someone else in the room.
+
+### Changed
+- Every interactive card rebuilt on one visual language: a semantic ink per state, one type role per purpose, a 20px grid, and copy that names the action rather than the gesture. Options that carry an explanation become full-width clickable rows so the reason sits inside the thing you press, instead of a legend below it. This channel's own copy is bilingual and ships an `i18n` map per string, so one card serves a mixed room in each reader's language, while model-authored text stays literal and untranslated — rewriting a command would be a lie about what runs.
+
+### Fixed
+- The bot's slash panel is published from a RESUMED session too, not only a fresh one. A chat that already had a durable session never took the create rung again, so the panel froze at whatever the channel offered the day that session began: every command added later worked when typed and was invisible to anyone who reached for `/`.
+- A tool whose per-agent shadow could not be registered is denied again, and the guard that enforces it is installed whenever anything is actually denied. It used to be keyed on the CONFIGURED deny list, so an empty one skipped installing the guard the fallback depends on.
+- Concurrency hardening across the bridge, closing six verified races. Inbound handling returns its promise to the transport, restoring the SDK's per-chat serialization that a voided promise had discarded. Approval questions copy an immutable call snapshot — keyed by session and cleaned per turn — so a card can never show one session's command while approving another's, and live as a small state machine registered before the card send, so an abort before, during, or after the send settles exactly once and repaints the card. Conversation releases advance a generation synchronously, so a walk that a release supersedes disposes its own product and retries instead of handing out a dying agent. Binding creation is single-flight. Reply targets correlate through the host's `user/message` events — a turn may consume several queued messages, and the answer follows the message actually consumed (the last of several), never arrival order; a turn that claims no message sends unaimed rather than guessing.
+- The reconnect watchdog now spends a budget: the platform meters connection attempts, so a never-resolving outage would have had it rebuilding forever. Ten rebuilds per thirty minutes are admitted — comfortably above what the backoff produces for a genuinely degraded link — and beyond that it pauses, says for how long, and resumes when the window slides, rather than burning the quota.
+- A reconnect watchdog supervises the transport's own recovery promise: the SDK's reconnect loop has terminal states (source-verified give-up paths, and a hang that schedules nothing), which left a live process with a silently dead lifeline for hours. A `reconnecting` not followed by `reconnected` within the deadline now rebuilds the transport through its public lifecycle, retrying under capped backoff and never going silent.
+- Operator console lines carry timestamps; the incident above was dated off a file mtime because the log could not say when its last line was written.
+
+## 0.0.4 — 2026-08-14
+
+### Added
+- In-chat workspace switching: `/cd <path|name>` points a conversation at a directory and `/ws` lists every workspace the host registry knows, each reachable by bare name. Every (conversation × directory) pair owns a durable session, so returning to a directory resumes the context built there. Switches persist through the settings service, `workspaceRoots` fences where `/cd` may go, the filesystem root / home root / home's parent are never accepted, and both commands run without an agent.
+- Per-conversation model switching: `/model` shows the current route and the host llm registry's advertised catalog, `/model use <provider/model|model>` switches from the next message on — the same session resumes under the new route with its context intact — and `/model reset` returns to the deployment default. Switches persist through the settings service; unlisted routes are set with a note, since the host catalog is advisory.
+- `/status` reports the conversation's workspace, model route, session id, turn activity, pending approvals, and the running plugin's version — without creating a session to answer.
+- A packaging spec packs the real tarball on every `pnpm test`, asserting the emitted runtime files and their relative-import graph ship closed.
+
+### Fixed
+- `files` now ships `lib` wholesale: the version helper became a bundler chunk shared by two entries, and the enumerating list did not carry it, so installs crash-looped on `ERR_MODULE_NOT_FOUND`. `prepack` is declared alongside `prepare`.
+- A `/cd` or `/model` switch that disposes a mid-turn agent clears the conversation's running mark itself, so `/status` cannot report a disposed turn as still running.
+- A message racing a switch's release can no longer be handed an agent mid-disposal: session acquisition re-derives the id and self-heals a stale binding.
+
+## 0.0.3 — 2026-08-14
+
+### Fixed
+- systemd units now send the bot's console to `~/.dsh-lark-channel.log` instead of the journal, which had left the log file empty on Linux — `start` could never relay the first-run QR code there.
+- `start` under systemd now attempts `loginctl enable-linger` and says so when lingering stays off, since a user service otherwise stops at logout.
+
+### Added
+- `dsh-lark-channel logs [-f]` prints the bot's recent console output, following it with `-f`.
+
+## 0.0.2 — 2026-08-14
+
+### Added
+- A one-command deployment CLI: `npx dsh-lark-channel start` provisions a dedicated profile, runs it in the background under launchd or `systemd --user` from the first moment, and relays the log to the terminal until the QR scan lands. `stop`, `restart`, and `status` manage it afterwards; systems with no supervisor fall back to a foreground run.
+- Unit files carry an explicit PATH (a supervisor's stunted default cannot run a `#!/usr/bin/env node` dsh), are user-only, escape everything interpolated, and forward environment-supplied Lark credentials so the supervised process sees them too.
+- CI runs typecheck and tests on push and pull request.
+
+## 0.0.1 — 2026-08-14
+
+- First npm release: the Lark/Feishu IM bot channel plugin, installable with `dsh plugin --profile web add dsh-lark-channel` — the registry tarball ships `lib/` prebuilt, so nothing compiles on install.

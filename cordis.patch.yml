@@ -1,0 +1,60 @@
+# Bundle patch applied over the selected DSH profile when this package is listed
+# in `dsh.profile.bundles`. The row id is deployment-local; the package name
+# must match package.json.
+
+- insert:
+    - id: lark-channel
+      name: 'dsh-lark-channel'
+      config:
+        # Credentials layer as: these entry values (env via `!!js`, never
+        # `!js`) → the user settings document. With neither set, first boot
+        # logs a QR URL; scanning it creates the app and the credentials
+        # persist through the host `settings` service.
+        appId: !!js process.env.LARK_APP_ID
+        appSecret: !!js process.env.LARK_APP_SECRET
+        # domain: https://open.larksuite.com   # default is Feishu
+        # cwd: an absolute workspace directory  # default is the host process cwd
+        # workspaceRoots: []   # directory prefixes /cd may enter; empty = any
+        # chatWorkspaces: {}   # managed by /cd via the settings service; not hand-edited
+        # chatModels: {}       # managed by /model via the settings service; not hand-edited
+        # provider: deepseek                    # default is the host agentDefaultModel
+        # model: deepseek-chat
+        # Output. `cot` shows the process as a native thinking-process message
+        # and sends the answer as an ordinary one; `stream` keeps the whole turn
+        # in one typewriter card, for clients older than that surface.
+        # output: cot
+        # showProcess: true          # off sends the answer alone
+        # attachImages: false        # only for a route that accepts images
+        # hideProcessWhenDone: false # let the platform drop a finished process
+        # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here
+        # syncSlashCommands: true    # publish commands to the bot's `/` panel
+        # sessionScope: chat         # chat-thread / chat-sender split it finer
+        requireMention: true
+        # Authorization narrows; it does not gate. Who can reach the bot at all
+        # is the app's visibility scope in the developer console. Unconfigured,
+        # this serves any room it is added to (when @-mentioned) and anyone the
+        # app is visible to.
+        # senderAllowlist: []   # empty serves anyone who can DM the app
+        # groupAllowlist: []    # empty serves any group
+        # approvers: []         # empty lets whoever drives a chat approve
+        #
+        # 三级分级管控（公司信息安全手册合规；绿区零打扰 / 黄区提醒 / 红区留痕）：
+        # yellowPatterns: [采购底价, 'BOM\s*表', 源代码]   # 黄区：命中提醒确认（默认种子见 config.ts）
+        # redPatterns: ['\b1[3-9]\d{9}\b', '\b\d{17}[\dXx]\b']  # 红区：命中强制留痕（默认种子为 PII 数据形态）
+        # onYellow: remind        # remind（默认，提醒确认后继续）| off
+        # onRed: block            # block（默认，拦截+留痕）| approval（转审批人+留痕）
+        # remindDedupeMinutes: 5  # 同会话同 pattern 去重窗口
+        # warnTools: []           # 工具黄区：自动放行+一次提醒
+        # approvalTools: []       # 工具红区：强制审批卡片+审计
+        # lockModel: false        # true = 模型切换需审批人（手册 10.3）
+        # auditEnabled: true      # 红区事件强制留痕，不受此开关影响
+        # auditLogFile: ''        # 缺省 $DSH_HOME/logs/lark-audit.jsonl
+        # auditRecordGreen: false # 绿区事件是否也记录
+        # auditStripPii: true     # 落盘前剥离 PII
+
+    # The invariant companion stays out of the default patch: the shipped
+    # dsh-base/web profiles compose no `invariants` service (it comes from the
+    # host's runtime-diagnostics composition), and a row waiting on the absent
+    # service fails the whole tree at boot. Diagnostic compositions add:
+    #   - id: lark-channel-invariant
+    #     name: 'dsh-lark-channel/invariant'

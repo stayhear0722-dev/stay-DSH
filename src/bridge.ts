@@ -1,0 +1,1808 @@
+/**
+ * The chat↔agent bridge: inbound Lark messages drive per-chat DSH agents,
+ * committed assistant output returns as chat messages, and host approval
+ * questions become interactive cards answered by button clicks.
+ * @module dsh-lark-channel/bridge
+ */
+
+import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
+import type {
+  CardActionEvent,
+  CardActionResponse,
+  LarkChannelError,
+  NormalizedMessage,
+  RejectEvent,
+  SendResult,
+} from '@larksuite/channel'
+import {
+  approvalCard as buildApprovalCard,
+  QUESTION_SELECT,
+  redlineApprovalCard,
+  sensitivityReminderCard,
+  settledApprovalCard as buildSettledApprovalCard,
+  settledGateCard,
+  toast,
+  TOAST,
+} from './cards.ts'
+import type { ResolvedConfig } from './config.ts'
+import type {
+  HostAgent,
+  HostAgentHandle,
+  HostAgentOptions,
+  HostAgentPresets,
+  HostAttachments,
+  HostAgentRegistry,
+  HostApprovalOutcome,
+  HostApprovalRequest,
+  HostDefaultModel,
+  HostLlm,
+  HostLoader,
+  HostSessionEvent,
+  HostSessionProjections,
+  HostCommands,
+  HostContentBlock,
+  HostSystemPrompt,
+  HostTools,
+  HostUserMessage,
+  HostWorkspace,
+  HostWorkspaceRegistry,
+} from './host.ts'
+import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent } from './host.ts'
+import { createCotRenderer } from './cot.ts'
+import type { CotPort } from './cot.ts'
+import { createMessageRenderer, createStreamRenderer } from './outbound.ts'
+import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
+import { refuseApprovalClick, refuseMessage } from './authorization.ts'
+import type { Authorization } from './authorization.ts'
+import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
+import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
+import {
+  ChatModels,
+  formatRoute,
+  MODEL_COMMAND,
+  modelActionValue,
+  modelPickerCard,
+  parseRoute,
+  runModelCommand,
+} from './model.ts'
+import type { CatalogEntry, ModelActionValue } from './model.ts'
+import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
+import type { StatusFields } from './status.ts'
+import { ChatQuestions, questionActionValue, shadowQuestionTool } from './questions.ts'
+import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
+import type { HostPlanMode, PlanReviewPorts } from './plan.ts'
+import type { AskedQuestion, QuestionAnswer } from './questions.ts'
+import { ownVersion } from './version.ts'
+import { collectImages } from './images.ts'
+import type { CollectedImages, ImagePort } from './images.ts'
+import { syncSlashPanel } from './slash-panel.ts'
+import type { SlashPanelPort } from './slash-panel.ts'
+import { ConversationSessions, conversationKey } from './session.ts'
+import type { ConversationSubject, SessionLadder } from './session.ts'
+import { createAttemptQuota, createReconnectWatchdog } from './liveness.ts'
+import { createHopBudget, exhaustedNotice, judgeBotMessage, servedNotice, strangerNotice } from './botchat.ts'
+import { batonNote, PRESENCE_ORDER, PRESENCE_SECTION, presenceSection } from './presence.ts'
+import type { BotSelf } from './presence.ts'
+import { instanceIdentity } from './instance.ts'
+import { createDlpEngine } from './dlp.ts'
+import type { InboundDecision } from './dlp.ts'
+import { AuditLog } from './audit.ts'
+import { GATE_ACTION, gateActionValue, redlineBlockMessage, ReminderState } from './remind.ts'
+import type { GateActionValue } from './remind.ts'
+import { createOutboundFilter, outboundBlockMessage, outboundVerifyNote } from './outbound-filter.ts'
+import type { OutboundAnswerFilter } from './outbound-filter.ts'
+
+/**
+ * The transport surface the bridge drives. `LarkChannel` from
+ * `@larksuite/channel` satisfies it structurally; tests substitute a fake.
+ */
+export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, CotPort {
+  /** Open the transport (WebSocket long connection by default). */
+  connect(): Promise<void>
+  /** Close the transport and release its resources. */
+  disconnect(): Promise<void>
+  /**
+   * The transport's own account of its connection, when it offers one. The
+   * SDK reports `failed` for its terminal give-up state, which is exactly the
+   * state the reconnect watchdog exists to catch.
+   */
+  getConnectionStatus?(): { readonly state?: string } | undefined
+  /** Subscribe one normalized inbound event; returns the unsubscriber. */
+  on(name: 'message', handler: (msg: NormalizedMessage) => void | Promise<void>): () => void
+  on(
+    name: 'cardAction',
+    handler: (evt: CardActionEvent) => void | CardActionResponse | Promise<void | CardActionResponse>,
+  ): () => void
+  /**
+   * A message the transport's own policy layer refused. Subscribing is the only
+   * way to tell "the bot ignored me" apart from "the bot is broken": a refusal
+   * never reaches the `message` handler and is reported nowhere else.
+   */
+  on(name: 'reject', handler: (evt: RejectEvent) => void): () => void
+  /**
+   * A transport failure, including one thrown by an inbound handler: those do
+   * NOT reject the awaited dispatch, so an unsubscribed channel loses them.
+   */
+  on(name: 'error', handler: (err: LarkChannelError) => void): () => void
+  /** The long connection dropped; events arriving in the gap are not replayed. */
+  on(name: 'reconnecting', handler: () => void): () => void
+  /** The long connection is live again. */
+  on(name: 'reconnected', handler: () => void): () => void
+  /**
+   * This bot's own identity, resolved during connect. Optional here so a fake
+   * port need not implement it; it throws before connect, which callers treat
+   * as "not known yet".
+   */
+  getBotIdentity?(): { readonly openId: string; readonly name?: string }
+  /** Replace a sent card's content in place. */
+  updateCard(messageId: string, card: object): Promise<void>
+}
+
+/** One conversation's chat and its outbound renderer, keyed by session id. */
+interface ChatBinding {
+  readonly chatId: string
+  /** `p2p` or a group kind; approvals in a group are judged as the room. */
+  readonly chatType: string
+  readonly renderer: OutboundRenderer
+}
+
+/**
+ * What one agent creation or resume composes, and the registry view the
+ * session's calls are described through. A resumed agent needs the same
+ * composition a fresh one gets.
+ */
+interface AgentComposition {
+  /** Recorded on a created session so a later reader knows which preset it joined. */
+  readonly presetId?: string
+  /** Names what each call of this session's tools does, and its category. */
+  readonly presentCall: ToolPresentation
+  /** Creation-time composition: the preset join plus this channel's own rows. */
+  readonly setup: (agentCtx: Context) => Promise<void>
+}
+
+/**
+ * The `agents` registry as durable sessions need it. {@link HostAgentRegistry}
+ * declares only `create`, so the two further rungs are narrowed here, the way
+ * every other host service this bridge consumes is.
+ */
+interface DurableAgentRegistry extends HostAgentRegistry {
+  /**
+   * The live agent published on one session id.
+   * @param sessionId - the session id to probe.
+   * @returns the live agent, or undefined when nothing runs on that id.
+   */
+  get(sessionId: string): HostAgent | undefined
+  /**
+   * Load a stored session as a live agent. Takes no `meta`: the stored header
+   * already carries the session's cwd and preset.
+   * @param options - the session to load, its model route, and its composition.
+   * @returns the resumed handle.
+   * @throws when no session is stored under the id, or its log cannot be read.
+   */
+  resume(options: {
+    readonly resumeSessionId: string
+    readonly agentOptions?: HostAgentOptions
+    readonly setup?: (agentCtx: Context) => Promise<void>
+  }): Promise<HostAgentHandle>
+}
+
+/**
+ * The immutable facts of one tool call, copied at ask time. An approval is
+ * decided by a human reading these; they must never be re-read from a mutable
+ * map after the card exists, or a concurrent turn's write shows one command
+ * while another is approved.
+ */
+interface CallSnapshot {
+  readonly sessionId: string
+  readonly turn: number
+  readonly callId: string
+  readonly arguments: string
+}
+
+/**
+ * One approval question, from before its card is sent until it settles.
+ *
+ * `sending` — the card send is in flight; a settlement (abort, disposal)
+ * resolves the asker immediately and the send's return path paints the card.
+ * `open` — the card exists and a click may decide it.
+ * `settled` — decided; kept only until the card is painted.
+ */
+interface PendingApproval {
+  readonly chatId: string
+  readonly chatType: string
+  readonly toolName: string
+  /** Captured call facts; undefined when the asker named no call. */
+  readonly call?: CallSnapshot | undefined
+  /** Set once the platform accepted the card. */
+  messageId?: string | undefined
+  state: 'sending' | 'open' | 'settled'
+  outcome?: HostApprovalOutcome | undefined
+  decidedBy?: string | undefined
+  settle(outcome: HostApprovalOutcome): void
+  /** Detaches the abort listener, so a settled question leaks no handler. */
+  removeAbort?: (() => void) | undefined
+}
+
+/** Marker distinguishing this plugin's approval buttons from other card actions. */
+const APPROVAL_ACTION = 'dsh-lark-channel/approval'
+
+/** Card-button payload carried by an approval decision. */
+interface ApprovalActionValue {
+  readonly kind: typeof APPROVAL_ACTION
+  readonly id: string
+  readonly decision: 'allow' | 'reject'
+}
+
+/**
+ * Narrow an arbitrary card-action value to this plugin's approval payload.
+ * @param value - raw button value from a card action event.
+ * @returns the typed payload, or undefined for foreign card actions.
+ */
+function approvalActionValue(value: unknown): ApprovalActionValue | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (record.kind !== APPROVAL_ACTION) return undefined
+  if (typeof record.id !== 'string') return undefined
+  if (record.decision !== 'allow' && record.decision !== 'reject') return undefined
+  return { kind: APPROVAL_ACTION, id: record.id, decision: record.decision }
+}
+
+/**
+ * Build the interactive approval card for one permission question.
+ * @param toolName - the tool the question is about.
+ * @param reason - the asker's explanation, when it gave one.
+ * @param id - correlation id carried by both decision buttons.
+ * @returns a Feishu card object for `send({ card })`.
+ */
+function approvalCard(
+  toolName: string,
+  reason: string | undefined,
+  command: string | undefined,
+  id: string,
+): object {
+  return buildApprovalCard({
+    toolName,
+    reason,
+    command,
+    allow: { kind: APPROVAL_ACTION, id, decision: 'allow' },
+    reject: { kind: APPROVAL_ACTION, id, decision: 'reject' },
+  })
+}
+
+/**
+ * Build the static replacement card shown after an approval settles.
+ * @param toolName - the tool the question was about.
+ * @param outcome - the closed decision.
+ * @param decidedBy - who pressed, when a person did. Named rather than
+ * withheld: with approvals open to a room, the room should see whose press
+ * granted the escalation.
+ * @returns a Feishu card object for `updateCard`.
+ */
+function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?: string): object {
+  return buildSettledApprovalCard({ toolName, outcome, decidedBy })
+}
+
+/** How long one tool-activity label may be before it is ellipsized. */
+const ACTIVITY_LABEL_MAX_CHARS = 90
+
+/**
+ * How long a `reconnecting` may stand before the watchdog presumes the SDK's
+ * recovery dead. Generous on purpose: the SDK's own flapping cycles recover in
+ * seconds, and a false rebuild bounces a connection that was about to live.
+ */
+const RECONNECT_DEADLINE_MS = 3 * 60 * 1000
+
+/** Rebuild retry delays; the last entry repeats forever. */
+const RECONNECT_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000] as const
+
+/**
+ * Rebuild budget. The platform meters connection attempts, so an outage that
+ * never resolves must not have this watchdog hammering it: under the backoff
+ * above a genuinely degraded link uses roughly eight attempts an hour, which
+ * this admits, while a tight rebuild-drop loop trips it and pauses.
+ */
+const RECONNECT_QUOTA_WINDOW_MS = 30 * 60 * 1000
+const RECONNECT_QUOTA_LIMIT = 10
+
+/** The host tool this channel shadows so questions become chat cards. */
+const QUESTION_TOOL = 'ask_user_question'
+
+/**
+ * How many unclaimed reply targets may wait for their `user/message` event. A
+ * target is claimed within one turn ordinarily; the cap only matters when an
+ * agent dies between accepting a followup and starting its turn.
+ */
+const MAX_PENDING_TARGETS = 500
+
+/**
+ * Reduce one presentation title to a single safe card line: the value is
+ * model-influenced (a search pattern, a command) and rides a markdown card, so
+ * newlines and code fences — the two things that could restructure the card —
+ * come out, and the rest is bounded.
+ * @param title - the tool's own label for this call.
+ * @returns the label as one bounded line.
+ */
+function activityLabel(title: string): string {
+  // One pass over both hazards: any run of whitespace (newlines included) or
+  // backticks collapses to a single space, so neither a line break nor a code
+  // fence in a model-influenced value can restructure the card.
+  const line = title.replace(/[\s`]+/g, ' ').trim()
+  return line.length <= ACTIVITY_LABEL_MAX_CHARS
+    ? line
+    : `${line.slice(0, ACTIVITY_LABEL_MAX_CHARS - 1)}…`
+}
+
+/**
+ * Build the tool-call describer for one agent's view of the registry. Prefers
+ * the tool's own `presentCall` title — the label the host's own surfaces show,
+ * so a chat line says what a call does rather than repeating its name — then
+ * the model's `description` argument, then the bare name.
+ * @param tools - the host tool registry, when composed.
+ * @param scope - the viewing scope key holding this agent's tools.
+ * @returns a describer safe to call on every `tool/call` event.
+ */
+function createCallPresenter(tools: HostTools | undefined, scope: unknown): ToolPresentation {
+  return (name, argumentsJson) => {
+    let args: unknown
+    try {
+      args = JSON.parse(argumentsJson)
+    } catch {
+      // Raw model output: malformed JSON is the model's mistake, not a reason
+      // to lose the activity line.
+      return { title: name }
+    }
+    try {
+      const view = tools?.get(name, scope)?.presentCall?.(args)
+      const title = view?.title
+      if (typeof title === 'string' && title.trim() !== '') {
+        return {
+          title: activityLabel(title),
+          ...typeof view?.kind === 'string' ? { kind: view.kind } : {},
+        }
+      }
+    } catch {
+      // presentCall is contracted pure, but it is another package's code and a
+      // throw here must not cost the chat its activity line.
+    }
+    const described = (args as { description?: unknown } | null)?.description
+    return typeof described === 'string' && described.trim() !== ''
+      ? { title: `${name} · ${activityLabel(described)}` }
+      : { title: name }
+  }
+}
+
+/**
+ * Compose the parts of a chat agent's world this channel owns: the tools it
+ * must not call, and the prompt sentence that tells the model what to do
+ * instead. Both registrations are scoped to this one agent.
+ * @param agentCtx - the agent's scope context, inside creation `setup`.
+ * @param config - resolved plugin configuration.
+ */
+function composeChatAgent(
+  agentCtx: Context,
+  config: ResolvedConfig,
+  askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
+  planReview: PlanReviewPorts | undefined,
+  self: BotSelf,
+): void {
+  const tools = agentCtx.get('tools') as HostTools | undefined
+  const denied = new Set(config.denyTools)
+
+  // Shadow the host's question tool for THIS agent: its answer would otherwise
+  // surface on whichever UI claimed the single `userQuestions` provider, while
+  // the person who asked is here. Registered before the guard so a deployment
+  // that also denies the name still denies it — configuration wins.
+  const shadowed = askQuestions !== undefined
+    && !denied.has(QUESTION_TOOL)
+    && tools?.register !== undefined
+  if (shadowed) tools?.register?.(shadowQuestionTool(askQuestions))
+  // A registry too old to shadow leaves the host's GUI-only tool in place;
+  // denying it keeps the model from asking where no one is watching.
+  if (!shadowed && askQuestions !== undefined) denied.add(QUESTION_TOOL)
+
+  // The plan tool is shadowed for the same reason and on the same terms: its
+  // review reaches for that same single-provider seam. Only worth registering
+  // where a plan service exists to leave plan mode afterwards — without one
+  // the host tool is not composed either, so there is nothing to shadow.
+  const shadowedPlan = planReview !== undefined
+    && planReview.planMode() !== undefined
+    && !denied.has(PLAN_TOOL)
+    && tools?.register !== undefined
+  if (shadowedPlan) tools?.register?.(shadowPlanTool(planReview!))
+  if (!shadowedPlan && planReview?.planMode() !== undefined) denied.add(PLAN_TOOL)
+
+  // Every chat agent gets its bearings, denials or none: an agent told nothing
+  // about where it woke up treats a chat like a ticket queue.
+  const prompt = agentCtx.get('systemPrompt') as HostSystemPrompt | undefined
+  prompt?.section({
+    name: PRESENCE_SECTION,
+    order: PRESENCE_ORDER,
+    text: presenceSection(self, [...denied]),
+  })
+
+  if (denied.size === 0) return
+  // A guard rather than `tools.restrict()`: restrict validates its names
+  // against the inherited registry and THROWS for one this composition does
+  // not have, which would fail every chat agent's creation over a tool the
+  // deployment simply never composed.
+  tools?.guard(execution =>
+    denied.has(execution.name)
+      ? `${execution.name} is unavailable in this chat channel: its answer would surface on a `
+        + 'different interface. Ask the user directly in your reply instead, and continue when they answer.'
+      : undefined,
+  )
+}
+
+/**
+ * Create an identified user message from one chat input. Group messages carry
+ * the sender so the model can tell voices apart; direct messages stay verbatim.
+ * @param msg - normalized inbound chat message.
+ * @returns a frozen user message for `agent.followup()`.
+ */
+export function chatUserMessage(msg: NormalizedMessage, images: CollectedImages): HostUserMessage {
+  const spoken = msg.chatType === 'group'
+    ? `${msg.senderName ?? msg.senderId}: ${msg.content}`
+    : msg.content
+  // Only an agent's message carries the baton note: a human reads everything
+  // said in their own chat, mention or not.
+  const note = msg.senderIsBot === true ? batonNote(msg.senderId) : ''
+  // Notes ride the text so a model that cannot be shown an image still knows
+  // one was sent, instead of answering as though it had seen it.
+  const text = [spoken, note, ...images.notes].filter(line => line !== '').join('\n')
+  const content: HostContentBlock[] = [
+    ...text === '' ? [] : [{ type: 'text' as const, text }],
+    ...images.blocks,
+  ]
+  return Object.freeze({
+    id: randomUUID(),
+    role: 'user',
+    content: Object.freeze(content),
+    source: Object.freeze({ kind: 'user' } as const),
+  })
+}
+
+/**
+ * Install the bridge on a scoped plugin context. Every registration is owned
+ * by the context's fiber: disposal disconnects the transport, disposes every
+ * agent this channel owns, and settles pending approvals as `'cancelled'`.
+ * @param ctx - scoped plugin context carrying the `agents` service.
+ * @param config - resolved plugin configuration.
+ * @param port - the transport to drive; production passes the real Lark channel.
+ */
+export function installBridge(
+  ctx: Context,
+  config: ResolvedConfig,
+  port: ChannelPort,
+  notify: (line: string) => void,
+  authorization: Authorization,
+  persistState: (patch: object) => Promise<boolean> = async () => false,
+  liveness?: {
+    readonly deadlineMs?: number
+    readonly backoffMs?: readonly number[]
+    readonly quotaWindowMs?: number
+    readonly quotaLimit?: number
+  },
+): void {
+  const bySession = new Map<string, ChatBinding>()
+  const pendingApprovals = new Map<string, PendingApproval>()
+  /**
+   * Tool-call arguments by session, then call id, with the turn that made the
+   * call. An approval names the call it decides but not what that call does,
+   * and the human cannot judge an escalation without seeing the command. Keyed
+   * per session because call ids are only unique within a producer — one flat
+   * map let concurrent sessions overwrite each other's entries, showing one
+   * session's command on another session's card — and cleaned per (session,
+   * turn) because within a session an id is only known unique per turn.
+   */
+  const callSnapshots = new Map<string, Map<string, { readonly turn: number; readonly arguments: string }>>()
+  const defaultCwd = resolve(config.cwd ?? process.cwd())
+
+  // 三级分级管控（手册第 10 章）：
+  // 审计（红区强制留痕）、入站 DLP 引擎、出站过滤、黄区提醒去重、门控中的待放行消息。
+  const audit = new AuditLog({
+    logFile: config.auditLogFile,
+    stripPii: config.auditStripPii,
+    recordGreen: config.auditRecordGreen,
+    report: notify,
+  })
+  const dlp = createDlpEngine(config, notify)
+  const outboundFilter = createOutboundFilter(config.yellowPatterns, config.redPatterns, notify)
+  const reminders = new ReminderState()
+  /** 门控中的入站消息：correlationId → 待放行内容（黄区确认 / 红区审批）。 */
+  const pendingGates = new Map<string, {
+    readonly msg: NormalizedMessage
+    readonly key: string
+    readonly tier: 'yellow' | 'red'
+    readonly pattern: string | undefined
+  }>()
+
+  /** Which directory each conversation runs in, and the session id that pair owns. */
+  const chatEpochs = new ChatEpochs({
+    entries: config.chatEpochs,
+    persist: persistState,
+    report: notify,
+  })
+
+  const chatWorkspaces = new ChatWorkspaces({
+    defaultPath: defaultCwd,
+    entries: config.chatWorkspaces,
+    roots: config.workspaceRoots,
+    persist: persistState,
+    report: notify,
+    // Every session id this row derives carries its own prefix, so two bots
+    // invited to one group drive two agents rather than fighting over one.
+    sessionPrefix: instanceIdentity(config.instance).sessionPrefix,
+    // A conversation that started over derives a further id; one that never
+    // did derives exactly what it always did.
+    epochOf: baseId => chatEpochs.epochOf(baseId),
+    // The host registry's listing, read fresh per use: every workspace this
+    // human already uses with the host is a `/cd` destination worth offering.
+    known: () => {
+      const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
+      if (registry?.list === undefined) return []
+      try {
+        return registry.list().map(workspace => workspace.path)
+      } catch {
+        return []
+      }
+    },
+  })
+
+  /** Which model route each conversation asked for, against the deployment default. */
+  const chatModels = new ChatModels({
+    entries: config.chatModels,
+    persist: persistState,
+    report: notify,
+  })
+
+  /**
+   * The directory and route each session id was derived for. The ladder is
+   * keyed by session id alone, so its rungs read these back here rather than
+   * widening every rung's signature with context most of them ignore. A model
+   * route is NOT part of the id — the same session resumes under a new route,
+   * context intact — so the override map is refreshed on every derivation.
+   */
+  const pathBySession = new Map<string, string>()
+  const routeBySession = new Map<string, HostAgentOptions>()
+  const sessionIdForKey = (key: string): string => {
+    const id = chatWorkspaces.sessionIdFor(key)
+    pathBySession.set(id, chatWorkspaces.pathFor(key))
+    const route = chatModels.routeFor(key)
+    if (route === undefined) routeBySession.delete(id)
+    else routeBySession.set(id, route)
+    return id
+  }
+
+  /**
+   * The workspace record a directory's sessions are accounted under, resolved
+   * once per directory. Workspace grouping is an ACCOUNT, not a cwd derivation:
+   * a session nobody attaches stays in the GUI's Ungrouped bucket however its
+   * cwd reads. Registering the directory when no record exists keeps chat
+   * sessions out of that bucket instead of orphaning every one of them.
+   */
+  const workspaceRecords = new Map<string, Promise<HostWorkspace | undefined>>()
+  const workspaceRecordFor = (path: string): Promise<HostWorkspace | undefined> => {
+    let pending = workspaceRecords.get(path)
+    if (pending === undefined) {
+      pending = (async () => {
+        const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
+        if (registry === undefined) return undefined
+        return (await registry.resolveByPath(path)) ?? await registry.create(path)
+      })().catch((error: unknown) => {
+        // Grouping is presentation: a chat must still work in a deployment
+        // whose registry refuses this directory.
+        notify(`lark-channel: workspace lookup failed for ${path}: ${String(error)}`)
+        return undefined
+      })
+      workspaceRecords.set(path, pending)
+    }
+    return pending
+  }
+
+  // Operator-facing, so it goes to the process stream as well as the logger:
+  // the shipped profiles compose no logger printer, and a silently swallowed
+  // outbound failure is indistinguishable from a hung chat.
+  const reportSendFailure = (error: unknown): void => {
+    const detail = error instanceof Error ? error.message : String(error)
+    notify(`lark-channel: outbound send failed: ${detail}`)
+    ctx.logger.warn('outbound send failed: %s', detail)
+  }
+
+  /** Resolve the provider/model for a new chat agent; config overrides the host default. */
+  const modelSelection = (): HostAgentOptions => {
+    if (config.provider !== undefined || config.model !== undefined) {
+      return { provider: config.provider, model: config.model }
+    }
+    const defaults = ctx.get('agentDefaultModel') as HostDefaultModel | undefined
+    if (defaults === undefined) {
+      throw new Error(
+        'lark-channel: no model configured — set config.provider/model or compose the agentDefaultModel service',
+      )
+    }
+    return defaults.currentSelection()
+  }
+
+  /** The deployment default's display form; `/status` must not throw where creation may. */
+  const deploymentRoute = (): string => {
+    try {
+      return formatRoute(modelSelection())
+    } catch {
+      return '未配置'
+    }
+  }
+
+  /**
+   * Every route the host llm registry advertises, flattened. Advisory by that
+   * service's own contract, and absent services or throwing adapters degrade
+   * to an empty catalog rather than a failed command.
+   */
+  const modelCatalog = async (): Promise<readonly CatalogEntry[]> => {
+    const llm = ctx.get('llm') as HostLlm | undefined
+    if (llm === undefined) return []
+    try {
+      const lists = await Promise.all(llm.listProviders().map(async (provider) => {
+        try {
+          return await llm.listModels(provider.id)
+        } catch {
+          return []
+        }
+      }))
+      return lists.flat().map(model => ({ provider: model.provider, id: model.id, name: model.name }))
+    } catch {
+      return []
+    }
+  }
+
+  /** Whether each live session is inside a turn right now, for `/status`. */
+  const runningBySession = new Map<string, boolean>()
+
+  /**
+   * Reply targets by the UUID this bridge stamps on each followup, claimed
+   * when the host's `user/message` event echoes that id back inside a turn.
+   */
+  const targetByMessageId = new Map<string, ReplyTarget>()
+
+  /** Open intent-confirmation questions, and the two ways they get answered. */
+  const questions = new ChatQuestions({
+    send: async (chatId, card) => (await port.send(chatId, { card })).messageId,
+    update: async (messageId, card) => { await port.updateCard(messageId, card) },
+    report: notify,
+  })
+
+  /**
+   * Ask this agent's chat, one question at a time. Sequential on purpose: two
+   * open cards in one conversation would leave a typed answer ambiguous.
+   */
+  const askQuestions = async (
+    asked: readonly AskedQuestion[],
+    sessionId: string | undefined,
+  ): Promise<QuestionAnswer[]> => {
+    const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
+    if (binding === undefined || sessionId === undefined) {
+      // No chat to ask in — answer empty rather than hang the turn.
+      return asked.map(question => ({ id: question.id, selected: [] }))
+    }
+    const answers: QuestionAnswer[] = []
+    for (const question of asked) {
+      answers.push(await questions.ask({ sessionId, chatId: binding.chatId, question }))
+    }
+    return answers
+  }
+
+  /**
+   * Review one plan in its own chat: the plan as an ordinary message, then the
+   * decision as a card.
+   *
+   * The message goes first so the card lands under the thing it is about, and
+   * a failed send throws before the card exists — a decision card above a plan
+   * nobody can read is worse than a tool error the model can act on.
+   */
+  const planReview: PlanReviewPorts = {
+    publish: async (sessionId, plan) => {
+      const binding = bySession.get(sessionId)
+      if (binding === undefined) throw new Error('this plan has no chat to present in')
+      await port.send(binding.chatId, { markdown: plan })
+    },
+    review: async (sessionId, heading, signal) => {
+      const binding = bySession.get(sessionId)
+      if (binding === undefined) throw new Error('this plan has no chat to review it')
+      const answer = await questions.ask({
+        sessionId,
+        chatId: binding.chatId,
+        question: planReviewQuestion(heading),
+        ...signal === undefined ? {} : { signal },
+      })
+      return { selected: answer.selected, ...answer.custom === undefined ? {} : { custom: answer.custom } }
+    },
+    planMode: () => ctx.get('planMode') as HostPlanMode | undefined,
+  }
+
+  /** Resolved once; a display nicety must not be able to break activation. */
+  let pluginVersion = ''
+  try {
+    pluginVersion = ownVersion()
+  } catch {
+    // The row is simply omitted.
+  }
+
+  /**
+   * Resolve what one agent joins, and the view its calls are described through.
+   * A deployment with a preset roster keeps every model-facing row on the agent
+   * plane, so an agent that joins nothing reaches the model with NO tools and
+   * none of the deployment's prompt sections. The id is resolved up front to
+   * record it, and the join happens inside setup so a broken preset rolls the
+   * whole creation back instead of publishing a toolless session.
+   * @returns the composition every rung of one session's ladder applies.
+   * @throws when the roster supplies no such preset.
+   */
+  const composeAgent = async (): Promise<AgentComposition> => {
+    // Loader siblings mount concurrently; await the complete application so a
+    // first message arriving during boot never sees a half-composed agent world.
+    await (ctx.get('loader') as HostLoader | undefined)?.await()
+    const presets = ctx.get('agentPresets') as HostAgentPresets | undefined
+    const presetId = presets === undefined ? undefined : (await presets.resolve(config.preset)).id
+    // A roster keeps every tool off the global layer, so its standing key is
+    // the view that can describe this agent's calls.
+    const toolScope = presets === undefined || presetId === undefined
+      ? undefined
+      : await presets.standingKeyFor(presetId)
+    return {
+      ...presetId === undefined ? {} : { presetId },
+      presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
+      setup: async (agentCtx: Context) => {
+        if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
+        composeChatAgent(agentCtx, config, askQuestions, planReview, botSelf())
+      },
+    }
+  }
+
+  /**
+   * One composition per session id, shared by the resume attempt, the create
+   * that follows it, and the renderer that describes the session's calls.
+   * Resolving a preset re-reads the roster, and a first-contact chat walks every
+   * rung, so an uncached ladder would read the roster once per rung.
+   */
+  const compositions = new Map<string, Promise<AgentComposition>>()
+  const compositionFor = (sessionId: string): Promise<AgentComposition> => {
+    let pending = compositions.get(sessionId)
+    if (pending === undefined) {
+      pending = composeAgent()
+      compositions.set(sessionId, pending)
+      // A rejected composition is not replayed: the next message may arrive
+      // after the roster it named was fixed.
+      pending.catch(() => { compositions.delete(sessionId) })
+    }
+    return pending
+  }
+
+  const agents = ctx.agents as DurableAgentRegistry
+
+  const ladder: SessionLadder = {
+    lookup: (sessionId) => {
+      const agent = agents.get(sessionId)
+      // An agent another owner published is theirs to dispose.
+      return agent === undefined ? undefined : { agent, dispose: () => Promise.resolve() }
+    },
+    resume: async (sessionId) => {
+      const composition = await compositionFor(sessionId)
+      const handle = await agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
+        setup: composition.setup,
+      })
+      // Resuming publishes too. A chat that already has a durable session
+      // NEVER takes the create rung again, so publishing only from there froze
+      // the panel at whatever this channel offered the day that session began:
+      // every command added afterwards existed, worked when typed, and was
+      // invisible to everyone who reached for `/`.
+      publishSlashPanel(handle.agent)
+      return handle
+    },
+    create: async (sessionId) => {
+      const composition = await compositionFor(sessionId)
+      // The workspace's own canonical path, so `attachSession` finds the header
+      // cwd it validates against rather than an uncanonicalized variant of it.
+      const directory = pathBySession.get(sessionId) ?? defaultCwd
+      const workspace = await workspaceRecordFor(directory)
+      const handle = await agents.create({
+        sessionId,
+        meta: {
+          cwd: workspace?.path ?? directory,
+          ...composition.presetId === undefined ? {} : { agentPreset: composition.presetId },
+        },
+        agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
+        setup: composition.setup,
+      })
+      if (workspace !== undefined) {
+        await workspace.attachSession(sessionId).catch((error: unknown) => {
+          notify(`lark-channel: session ${sessionId} stays ungrouped: ${String(error)}`)
+        })
+      }
+      // The panel is app-wide, and the command list is only knowable from an
+      // agent's scope, so the first chat to exist is what can publish it.
+      publishSlashPanel(handle.agent)
+      return handle
+    },
+    // A rejected resume is the registry's only existence probe, and an
+    // unreadable session log looks exactly like a chat nobody ever messaged, so
+    // the ladder's handled failures are reported rather than swallowed.
+    report: (line) => { ctx.logger.info(line) },
+  }
+
+  const sessions = new ConversationSessions(config.sessionScope, ladder, sessionIdForKey)
+
+  /**
+   * The renderer for one session, opened on first use and kept until the fiber
+   * unwinds: it holds the turn's streaming card, which outlives any one message.
+   * @param sessionId - the session whose events it renders.
+   * @param msg - the message that reached this session.
+   * @returns the binding, the same object for every later message of the session.
+   * @throws when the session's composition cannot be resolved.
+   */
+  /** Set by the disposal sweep, so a binding resolving late closes itself. */
+  let unwound = false
+
+  /**
+   * In-flight and settled binding creations, one per session id. A plain
+   * check-then-create raced two concurrent callers into two renderers, one of
+   * them orphaned but still aimed at — the same promise-cache pattern the
+   * compositions use makes creation single-flight. A model switch resumes the
+   * same session id and REUSES its binding on purpose: the renderer presents
+   * calls through the preset's view, which a model change does not alter.
+   */
+  const bindings = new Map<string, Promise<ChatBinding>>()
+  const bindingFor = (sessionId: string, msg: NormalizedMessage): Promise<ChatBinding> => {
+    let pending = bindings.get(sessionId)
+    if (pending === undefined) {
+      pending = (async (): Promise<ChatBinding> => {
+        const { presentCall } = await compositionFor(sessionId)
+        // The renderer is the composition's last reader; dropping it here leaves
+        // the next conversation bound on this id to read the roster fresh.
+        compositions.delete(sessionId)
+        const binding: ChatBinding = {
+          chatId: msg.chatId,
+          chatType: msg.chatType,
+          renderer: renderFor(msg.chatId, presentCall),
+        }
+        if (unwound) {
+          // The fiber unwound while this was composing; nothing will ever
+          // dispatch to this renderer, so it must not hold an open card.
+          void binding.renderer.close()
+          throw new Error('lark-channel: bridge unwound while binding')
+        }
+        bySession.set(sessionId, binding)
+        return binding
+      })()
+      bindings.set(sessionId, pending)
+      pending.catch(() => {
+        // Only the failure that still owns the slot clears it: a stale
+        // rejection must not evict a successor's live promise.
+        if (bindings.get(sessionId) === pending) bindings.delete(sessionId)
+      })
+    }
+    return pending
+  }
+
+  /**
+   * The renderer one chat's output goes through.
+   *
+   * `cot` shows the process as the platform's own agent messages do — reasoning
+   * in a thinking area, each tool call with an icon and its result as a code
+   * block — and leaves the answer to an ordinary markdown message, which is
+   * where the platform says a final answer belongs. `stream` keeps the whole
+   * turn in one typewriter card instead, for clients older than that surface.
+   * Either way `showProcess` decides whether the process is shown at all.
+   * @param chatId - the chat this renderer serves.
+   * @param presentCall - the session's tool presenter.
+   * @returns the renderer for the configured output.
+   */
+  const renderFor = (chatId: string, presentCall: ToolPresentation): OutboundRenderer => {
+    if (config.output === 'stream') {
+      return createStreamRenderer(port, chatId, {
+        showProcess: config.showProcess,
+        presentCall,
+        onFailure: reportSendFailure,
+      })
+    }
+    // 回答级输出过滤（手册 10.2/10.4）：红区拦截 + 强制留痕，黄区追加核验提醒。
+    const answerFilter: OutboundAnswerFilter = {
+      decide: text => outboundFilter.decide(text),
+      blockedText: pattern => outboundBlockMessage(pattern),
+      warnNote: () => outboundVerifyNote(),
+      audit: (verdict, text) => {
+        if (verdict.action === 'block') {
+          audit.record({ kind: 'redline', source: 'outbound', chatId, pattern: verdict.pattern, action: 'blocked', length: text.length }, true)
+          return
+        }
+        audit.record({ kind: 'outbound', chatId, tier: verdict.tier, action: verdict.action === 'warn' ? 'warned' : 'sent', pattern: verdict.pattern, length: text.length })
+      },
+    }
+    return createCotRenderer(port, chatId, {
+      showProcess: config.showProcess,
+      hidden: config.hideProcessWhenDone,
+      presentCall,
+      onFailure: reportSendFailure,
+      answer: createMessageRenderer(port, chatId, reportSendFailure, answerFilter),
+    })
+  }
+
+  /** Mark a message as being worked on. Best-effort: the app may lack the scope. */
+  let panelPublished = false
+
+  /**
+   * Publish what this chat accepts to the bot's `/` panel, once. Fire and
+   * forget: discovery is a convenience, and every command works typed by hand.
+   */
+  const publishSlashPanel = (agent: HostAgent): void => {
+    if (!config.syncSlashCommands || panelPublished) return
+    panelPublished = true
+    const hosted = (ctx.get('commands') as HostCommands | undefined)?.list(agent) ?? []
+    const desired = [
+      ...hosted.map(descriptor => ({ name: descriptor.name, description: descriptor.description })),
+      { name: STOP_COMMAND, description: '停止当前任务' },
+      { name: CD_COMMAND, description: '切换本会话的工作区目录' },
+      { name: WS_COMMAND, description: '查看可用工作区' },
+      { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
+      { name: STATUS_COMMAND, description: '查看本会话状态' },
+      { name: NEW_COMMAND, description: '开一个新会话，清空上下文' },
+      { name: HELP_COMMAND, description: '显示可用命令' },
+    ]
+    void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
+      if (added.length > 0) notify(`lark-channel: registered /${added.join(', /')} on the bot's slash panel`)
+      if (removed.length > 0) notify(`lark-channel: removed /${removed.join(', /')} from the bot's slash panel`)
+    })
+  }
+
+  /** Bot senders this channel answers, and the budget their exchanges spend. */
+  const botPeers = new Set(config.botPeers)
+  const hops = createHopBudget(config.botHops)
+  /** Conversations already told their exchange stopped, so it is said once. */
+  const exhausted = new Set<string>()
+  /** Bots already named on the console, so an unlisted one is reported once per chat. */
+  const reportedBots = new Set<string>()
+  /**
+   * This channel's own bot id, so it can never answer itself. The transport
+   * resolves it during connect and THROWS before that, which is a diagnosis
+   * this path must not turn into a dropped message.
+   */
+  const botSelf = (): BotSelf => {
+    try {
+      const identity = port.getBotIdentity?.()
+      return identity === undefined ? {} : { name: identity.name, openId: identity.openId }
+    } catch {
+      return {}
+    }
+  }
+  const ownBotId = (): string | undefined => botSelf().openId
+
+  /** Aborts in-flight command executions when this bridge unwinds. */
+  const commands = new AbortController()
+  ctx.effect(() => () => { commands.abort() }, 'lark:commands')
+  const commandSignal = (): AbortSignal => commands.signal
+
+  /**
+   * Which conversation a control card governs, and where it was published.
+   * Only a per-sender scope makes a conversation one person's; under the other
+   * scopes the room owns it, exactly as the room owns its approvals.
+   */
+  const subjectOf = (msg: NormalizedMessage): ConversationSubject => ({
+    key: conversationKey(config.sessionScope, msg),
+    chatId: msg.chatId,
+    chatType: msg.chatType,
+    ...config.sessionScope === 'chat-sender' ? { owner: msg.senderId } : {},
+  })
+
+  /**
+   * Dispose one conversation's agent so the next message walks the ladder
+   * again — under a new id after `/cd`, or resuming the same session under a
+   * new route after a model switch.
+   *
+   * The session id is captured HERE, before the caller mutates any mapping:
+   * `/cd` re-derives to the new id by release time, and the activity mark to
+   * clear belongs to the OLD one. Clearing it now rather than waiting for a
+   * `turn/end` is deliberate — this side disposed the agent, so "nothing is
+   * running" is a synchronous fact, and the closing event of an aborted turn is
+   * not guaranteed to arrive.
+   */
+  const releaseFor = (key: string): (() => Promise<void>) => {
+    const releasedId = chatWorkspaces.sessionIdFor(key)
+    return async () => {
+      await sessions.release(key)
+      runningBySession.delete(releasedId)
+      callSnapshots.delete(releasedId)
+      questions.cancelSession(releasedId)
+      // 会话结束即清理该会话的提醒去重与未决门控，避免长驻进程内存增长。
+      reminders.clear(key)
+      for (const [correlationId, pending] of [...pendingGates]) {
+        if (pending.key === key) pendingGates.delete(correlationId)
+      }
+    }
+  }
+
+  /** Everything `/status` reports, read fresh from channel state. */
+  const statusFieldsFor = (subject: ConversationSubject): StatusFields => {
+    const sessionId = chatWorkspaces.sessionIdFor(subject.key)
+    const override = chatModels.routeFor(subject.key)
+    const route = override === undefined ? deploymentRoute() : formatRoute(override)
+    // Meters come off the LIVE session: a conversation whose agent has not been
+    // built yet has spent nothing, and reading its stored log to say so would
+    // load a log to report a zero.
+    const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(sessionId)
+    const meters = readMeters(
+      ctx.get('sessionProjections') as HostSessionProjections | undefined,
+      live?.session,
+    )
+    return {
+      ...meters,
+      workspace: chatWorkspaces.pathFor(subject.key),
+      workspaceIsDefault: chatWorkspaces.isDefault(subject.key),
+      route,
+      routeIsDefault: override === undefined,
+      sessionId,
+      bound: sessions.keyOf(sessionId) !== undefined,
+      running: runningBySession.get(sessionId) === true,
+      pendingApprovals: [...pendingApprovals.values()]
+        .filter(pending => pending.chatId === subject.chatId).length,
+      version: pluginVersion,
+    }
+  }
+
+  /**
+   * Whether one click may change the conversation its card names.
+   *
+   * A control card can be forwarded — the platform allows it and the payload
+   * travels with it — so the chat is checked first: the same buttons pressed
+   * in another room govern nothing. Beyond that a click is authorized exactly
+   * as a message would be, since it changes what the next message does.
+   * @param subject - the conversation the card was built for.
+   * @param evt - the click.
+   * @returns the refusal reason for the operator log, or undefined when allowed.
+   */
+  const refuseControlClick = (subject: ConversationSubject, evt: CardActionEvent): string | undefined => {
+    if (evt.chatId !== subject.chatId) {
+      return `click from chat ${evt.chatId} does not match the card's chat ${subject.chatId}`
+    }
+    if (subject.owner !== undefined && evt.operator.openId !== subject.owner) {
+      return `operator ${evt.operator.openId} does not own conversation ${subject.key}`
+    }
+    return refuseMessage(authorization, {
+      senderId: evt.operator.openId,
+      chatId: subject.chatId,
+      chatType: subject.chatType,
+    })
+  }
+
+
+  /**
+   * 门控卡片负载：把一次门控决定编码成卡片按钮的 value。
+   */
+  const gatePayload = (
+    subject: ConversationSubject,
+    correlationId: string,
+    tier: 'yellow' | 'red',
+    decision: 'confirm' | 'cancel',
+  ): GateActionValue => ({
+    kind: GATE_ACTION,
+    key: subject.key,
+    chatId: subject.chatId,
+    chatType: subject.chatType,
+    ...subject.owner === undefined ? {} : { owner: subject.owner },
+    correlationId,
+    tier,
+    decision,
+  })
+
+  /**
+   * 把一条已通过分级门控的普通消息交给 Agent：acquire → 命令/提问分发 →
+   * 组装用户消息 → followup。门控确认后放行的消息也走这里。
+   */
+  const deliver = async (msg: NormalizedMessage): Promise<void> => {
+    const opened = await sessions.acquire(msg)
+    const binding = await bindingFor(opened.handle.agent.session.id, msg)
+    // A slash line is a control, not a prompt: the host runs it without a
+    // model turn, so it must not be handed to the model as text — and it
+    // needs no reply target, since its answer is not an assistant turn.
+    if (isCommandLine(msg.content)) {
+      const outcome = await runCommandLine(
+        msg.content,
+        opened.handle.agent,
+        ctx.get('commands') as HostCommands | undefined,
+        commandSignal(),
+      )
+      if (outcome.reply !== '') {
+        await port.send(binding.chatId, { markdown: outcome.reply }).catch(reportSendFailure)
+      }
+      return
+    }
+    // A message answering an open question belongs to that question, not to
+    // a new turn: the agent is mid-run waiting for it. Checked AFTER command
+    // dispatch, so `/stop` still interrupts a chat that owes an answer.
+    if (questions.answerByText(opened.handle.agent.session.id, msg.content)) return
+
+    const images = await collectImages(
+      msg,
+      port,
+      ctx.get('attachments') as HostAttachments | undefined,
+      config.attachImages,
+    )
+    // The reply target is registered by MESSAGE ID and claimed when the
+    // host's `user/message` event names it, because a turn is not one
+    // message: the react loop drains several queued followups into a single
+    // turn, so aiming at arrival — or by turn order — replies to the wrong
+    // message the moment two overlap. When a turn consumes several, the last
+    // claim wins: a batched answer addresses the latest ask.
+    const message = chatUserMessage(msg, images)
+    const target: ReplyTarget = {
+      messageId: msg.messageId,
+      ...msg.threadId === undefined ? {} : { threadId: msg.threadId },
+    }
+    if (targetByMessageId.size >= MAX_PENDING_TARGETS) {
+      const oldest = targetByMessageId.keys().next().value
+      if (oldest !== undefined) targetByMessageId.delete(oldest)
+    }
+    targetByMessageId.set(message.id, target)
+    try {
+      opened.handle.agent.followup(message)
+    } catch (error) {
+      // A rejected followup will never produce the claiming event; its
+      // target must not linger to be claimed by an unrelated turn.
+      targetByMessageId.delete(message.id)
+      throw error
+    }
+  }
+
+  const handleMessage = async (msg: NormalizedMessage): Promise<void> => {
+    // Authorization before anything else: a message here starts a
+    // shell-capable agent. Refusals stay silent in the chat — answering would
+    // turn the bot into an oracle for who is authorized — and name the sender
+    // on the operator console, which is also how an owner finds their own id.
+    const refusal = refuseMessage(authorization, msg)
+    if (refusal !== undefined) {
+      notify(`lark-channel: ignored a message in ${msg.chatId}: ${refusal}`)
+      return
+    }
+    // A message from a bot is answered only where the deployment named that
+    // bot and the exchange still has hops left. `undefined` means the event
+    // omitted the sender kind, which is "unknown", not "not a bot" — and
+    // refusing every unknown sender would refuse ordinary traffic, so only a
+    // positive bot signal is judged here.
+    const conversation = conversationKey(config.sessionScope, msg)
+    if (msg.senderIsBot === true) {
+      const verdict = judgeBotMessage(
+        { senderId: msg.senderId, key: conversation, ownBotId: ownBotId() },
+        botPeers,
+        hops,
+      )
+      if (verdict.kind === 'stranger') {
+        // Once per bot per chat: the id is what an operator needs to allow it,
+        // and repeating it for every message would bury the rest of the log.
+        const seen = `${msg.chatId}/${verdict.senderId}`
+        if (!reportedBots.has(seen)) {
+          reportedBots.add(seen)
+          notify(strangerNotice(verdict.senderId, msg.chatId))
+        }
+        return
+      }
+      if (verdict.kind === 'self') return
+      if (verdict.kind === 'answer') {
+        // Named once per bot per chat: who can drive a shell-capable agent is
+        // a fact worth seeing, and here the answer is "a bot".
+        const seen = `${msg.chatId}/${msg.senderId}`
+        if (!reportedBots.has(seen)) {
+          reportedBots.add(seen)
+          notify(servedNotice(msg.senderId, msg.chatId))
+        }
+      }
+      if (verdict.kind === 'exhausted') {
+        // Said once, in the chat, because the humans there are the ones who
+        // can restart it — and saying it again per message is the very noise
+        // the budget exists to stop.
+        if (!exhausted.has(conversation)) {
+          exhausted.add(conversation)
+          await port.send(msg.chatId, { text: exhaustedNotice(verdict.spent) }).catch(reportSendFailure)
+        }
+        return
+      }
+    } else {
+      // A person speaking is the signal that the exchange is still wanted.
+      hops.reset(conversation)
+      exhausted.delete(conversation)
+    }
+    // An @-only ping carries no text; starting a turn on an empty prompt spends
+    // a turn for nothing. Skipped before the acknowledgement, which would
+    // otherwise promise work no turn is doing.
+    if (msg.content.trim() === '') return
+    // Channel-owned commands need no agent, so they run BEFORE acquisition: a
+    // `/cd` in a fresh chat must not first create the session in the directory
+    // it is switching away from, and `/status` must answer before a first
+    // message exists.
+    const channelCommand = commandName(msg.content)
+    if (
+      channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
+      || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
+      || channelCommand === NEW_COMMAND
+    ) {
+      try {
+        const key = conversation
+        // Dispose the conversation's current agent so the next message walks
+        // the ladder again — under a new id after `/cd`, or resuming the same
+        // session under the new route after `/model use`. The id is captured
+        // BEFORE the command mutates the mapping: `/cd` re-derives to the new
+        // id by release time, and the activity mark to clear belongs to the
+        // OLD one. Clearing here rather than waiting for a `turn/end` is
+        // deliberate — this side disposed the agent, so "nothing is running"
+        // is a synchronous fact, and the closing event of an aborted turn is
+        // not guaranteed to arrive.
+        const release = releaseFor(key)
+        const subject = subjectOf(msg)
+        let reply: { markdown: string } | { card: object }
+        if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
+          reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
+        } else if (channelCommand === NEW_COMMAND) {
+          reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
+        } else if (channelCommand === MODEL_COMMAND) {
+          // 模型路由锁定（手册 10.3）：锁定时只有审批人能切换；审批人未配置则完全锁定。
+          const approver = authorization.approvers.size > 0 && authorization.approvers.has(msg.senderId)
+          if (config.lockModel && !approver) {
+            audit.record({ kind: 'model', chatId: msg.chatId, from: 'any', to: 'any', action: 'blocked' }, true)
+            reply = {
+              markdown: '🔒 **模型切换已锁定**：本部署固定使用经审批的模型路由（手册 10.3 条）。如需切换，请联系信息安全部审批人。',
+            }
+          } else {
+            reply = await runModelCommand(msg.content, subject, chatModels, {
+              catalog: modelCatalog,
+              deploymentRoute,
+              release,
+            })
+          }
+        } else {
+          reply = { card: renderStatusCard(statusFieldsFor(subject), subject) }
+        }
+        await port.send(msg.chatId, reply).catch(reportSendFailure)
+      } catch (error) {
+        notify(`lark-channel: ${channelCommand} command failed in ${msg.chatId}: ${String(error)}`)
+        await port
+          .send(msg.chatId, { text: `⚠️ 命令执行失败：${error instanceof Error ? error.message : String(error)}` })
+          .catch(reportSendFailure)
+      }
+      return
+    }
+    // 三级分级门控（手册第 10 章）：命令行是控制不是提示，不参与分级；
+    // 普通提示按绿/黄/红处置——绿区零打扰、黄区单次提醒、红区强制留痕。
+    if (!isCommandLine(msg.content)) {
+      const decision: InboundDecision = dlp.decide(msg.content)
+      if (decision.action === 'pass') {
+        audit.record({ kind: 'inbound', senderId: msg.senderId, chatId: msg.chatId, tier: 'green', action: 'passed', length: msg.content.length })
+      } else if (decision.action === 'remind') {
+        const pattern = decision.pattern ?? ''
+        const now = Date.now()
+        if (reminders.shouldRemind(conversation, pattern, now, config.remindDedupeMinutes)) {
+          reminders.markReminded(conversation, pattern, now)
+          const correlationId = randomUUID()
+          pendingGates.set(correlationId, { msg, key: conversation, tier: 'yellow', pattern: decision.pattern })
+          audit.record({ kind: 'inbound', senderId: msg.senderId, chatId: msg.chatId, tier: 'yellow', action: 'reminded', pattern: decision.pattern, length: msg.content.length })
+          await port.send(msg.chatId, {
+            card: sensitivityReminderCard({
+              reason: decision.pattern,
+              injection: decision.injection,
+              confirm: gatePayload(subjectOf(msg), correlationId, 'yellow', 'confirm'),
+              cancel: gatePayload(subjectOf(msg), correlationId, 'yellow', 'cancel'),
+            }),
+          }).catch(reportSendFailure)
+          return
+        }
+        // 去重窗口内：不重复打扰，直接放行。
+        audit.record({ kind: 'inbound', senderId: msg.senderId, chatId: msg.chatId, tier: 'yellow', action: 'passed-dedup', pattern: decision.pattern, length: msg.content.length })
+      } else if (decision.action === 'block') {
+        // 红线：强制留痕（写失败也必须拦截），给出合规出路。
+        const recorded = audit.record({ kind: 'redline', source: 'inbound', chatId: msg.chatId, pattern: decision.pattern, action: 'blocked', length: msg.content.length }, true)
+        audit.record({ kind: 'inbound', senderId: msg.senderId, chatId: msg.chatId, tier: 'red', action: 'blocked', pattern: decision.pattern, length: msg.content.length }, true)
+        if (!recorded) notify('lark-channel: 红线入站事件审计写入失败——消息仍被拒绝')
+        await port.send(msg.chatId, { text: redlineBlockMessage(decision.pattern) }).catch(reportSendFailure)
+        return
+      } else {
+        // 红区转审批：审批人决定放行与否，全程留痕。
+        const correlationId = randomUUID()
+        pendingGates.set(correlationId, { msg, key: conversation, tier: 'red', pattern: decision.pattern })
+        audit.record({ kind: 'inbound', senderId: msg.senderId, chatId: msg.chatId, tier: 'red', action: 'pending-approval', pattern: decision.pattern, length: msg.content.length }, true)
+        await port.send(msg.chatId, {
+          card: redlineApprovalCard({
+            reason: decision.pattern,
+            allow: gatePayload(subjectOf(msg), correlationId, 'red', 'confirm'),
+            reject: gatePayload(subjectOf(msg), correlationId, 'red', 'cancel'),
+          }),
+        }).catch(reportSendFailure)
+        return
+      }
+    }
+    try {
+      await deliver(msg)
+    } catch (error) {
+      notify(`lark-channel: agent creation failed for chat ${msg.chatId}: ${String(error)}`)
+      ctx.logger.warn('agent creation failed for chat %s: %s', msg.chatId, error)
+      await port
+        .send(msg.chatId, { text: `⚠️ 无法启动会话：${error instanceof Error ? error.message : String(error)}` })
+        .catch(reportSendFailure)
+    }
+  }
+
+  /**
+   * Decide one approval exactly once. The asker is resolved immediately; the
+   * card is painted here when it already exists, and by the send's return path
+   * when the settlement raced the send — either way exactly one of them does.
+   */
+  const settleApproval = (
+    id: string,
+    outcome: HostApprovalOutcome,
+    decidedBy?: string,
+    repaint = true,
+  ): boolean => {
+    const pending = pendingApprovals.get(id)
+    if (pending === undefined || pending.state === 'settled') return false
+    pending.state = 'settled'
+    pending.outcome = outcome
+    pending.decidedBy = decidedBy
+    pending.removeAbort?.()
+    pending.settle(outcome)
+    if (!repaint) {
+      // The caller paints it — a click answers with the decided card, which is
+      // the one repaint path that cannot fail unnoticed.
+      pendingApprovals.delete(id)
+      return true
+    }
+    if (pending.messageId !== undefined) {
+      pendingApprovals.delete(id)
+      void port
+        .updateCard(pending.messageId, settledCard(pending.toolName, outcome, decidedBy))
+        .catch(reportSendFailure)
+    }
+    return true
+  }
+
+  const askViaCard = async (
+    binding: ChatBinding,
+    request: HostApprovalRequest,
+    next: () => Promise<HostApprovalOutcome>,
+  ): Promise<HostApprovalOutcome> => {
+    // A withdrawn question needs no card — and the abort event does not replay
+    // for listeners added late, so the flag is the only signal that survives.
+    // Read through a call: the flag mutates across awaits, which control-flow
+    // narrowing would otherwise reason away.
+    const withdrawn = (): boolean => request.signal?.aborted === true
+    if (withdrawn()) return 'cancelled'
+
+    // The call's facts are copied NOW: the source map is mutable shared state,
+    // and the card must show exactly what the click will approve.
+    const recorded = request.callId === undefined
+      ? undefined
+      : callSnapshots.get(request.agent.session.id)?.get(request.callId)
+    const call: CallSnapshot | undefined = recorded === undefined || request.callId === undefined
+      ? undefined
+      : {
+          sessionId: request.agent.session.id,
+          turn: recorded.turn,
+          callId: request.callId,
+          arguments: recorded.arguments,
+        }
+
+    // Registered BEFORE the send: a click can arrive the moment the card
+    // renders, and an abort can arrive while the send is in flight — both need
+    // the question to already exist here.
+    const id = randomUUID()
+    let resolveOutcome!: (outcome: HostApprovalOutcome) => void
+    const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
+    const onAbort = (): void => { settleApproval(id, 'cancelled') }
+    const pending: PendingApproval = {
+      chatId: binding.chatId,
+      chatType: binding.chatType,
+      toolName: request.toolName,
+      call,
+      state: 'sending',
+      settle: resolveOutcome,
+      removeAbort: () => { request.signal?.removeEventListener('abort', onAbort) },
+    }
+    pendingApprovals.set(id, pending)
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+
+    let sent: SendResult
+    try {
+      sent = await port.send(binding.chatId, {
+        card: approvalCard(
+          request.toolName,
+          request.reason,
+          call?.arguments,
+          id,
+        ),
+      })
+    } catch (error) {
+      reportSendFailure(error)
+      if (settleApproval(id, 'cancelled') && !withdrawn()) {
+        // Nothing reached a human and nothing was withdrawn: let the next
+        // composed answerer decide instead of silently cancelling the ask.
+        pendingApprovals.delete(id)
+        return next()
+      }
+      pendingApprovals.delete(id)
+      return settled
+    }
+
+    pending.messageId = sent.messageId
+    if (pending.state === 'settled') {
+      // Settled while the send was in flight: the asker is long answered, but
+      // the platform just rendered a live card — paint it settled here.
+      pendingApprovals.delete(id)
+      void port
+        .updateCard(sent.messageId, settledCard(pending.toolName, pending.outcome ?? 'cancelled', pending.decidedBy))
+        .catch(reportSendFailure)
+    } else {
+      pending.state = 'open'
+    }
+    return settled
+  }
+
+  const handleCardAction = async (evt: CardActionEvent): Promise<CardActionResponse | undefined> => {
+    const choice = questionActionValue(evt.action.value)
+    if (choice !== undefined) {
+      // A question is a choice, not an escalation: anyone the chat serves may
+      // answer it, exactly as they could by typing the answer instead.
+      //
+      // A multiple choice arrives as a form submission, whose chosen set the
+      // platform delivers beside the button's own value rather than in it.
+      const submitted = (evt.action.formValue as Record<string, unknown> | undefined)?.[QUESTION_SELECT]
+      const settled = questions.answerByClick(
+        choice,
+        Array.isArray(submitted) ? submitted.map(entry => String(entry)) : [],
+      )
+      return settled === undefined
+        ? { toast: toast('info', TOAST.questionGone) }
+        : { toast: toast('success', TOAST.answered), card: { type: 'raw', data: settled } }
+    }
+    const pick = modelActionValue(evt.action.value)
+    if (pick !== undefined) return switchModel(pick, evt)
+    const refresh = statusActionValue(evt.action.value)
+    if (refresh !== undefined) {
+      const refusal = refuseControlClick(refresh, evt)
+      if (refusal !== undefined) {
+        notify(`lark-channel: rejected a status refresh: ${refusal}`)
+        return { toast: toast('error', TOAST.notYours) }
+      }
+      return {
+        toast: toast('success', TOAST.refreshed),
+        card: { type: 'raw', data: renderStatusCard(statusFieldsFor(refresh), refresh) },
+      }
+    }
+    const gate = gateActionValue(evt.action.value)
+    if (gate !== undefined) return decideGate(gate, evt)
+    const value = approvalActionValue(evt.action.value)
+    if (value === undefined) return undefined
+    return decideApproval(value, evt)
+  }
+
+  /**
+   * 处理门控卡片按钮（黄区确认 / 红区审批）。
+   * 黄区：本人可在原聊天确认自己的消息；红区：必须审批人。
+   * 无论放行与否，都写审计；放行后消息继续走 Agent。
+   */
+  const decideGate = async (gate: GateActionValue, evt: CardActionEvent): Promise<CardActionResponse> => {
+    const pending = pendingGates.get(gate.correlationId)
+    if (pending === undefined || pending.msg.chatId !== evt.chatId) {
+      return { toast: toast('info', TOAST.notYours) }
+    }
+    if (gate.tier === 'red') {
+      const refusal = refuseApprovalClick(
+        authorization,
+        { operatorId: evt.operator.openId, chatId: evt.chatId },
+        { chatId: pending.msg.chatId, chatType: pending.msg.chatType },
+      )
+      if (refusal !== undefined) {
+        notify(`lark-channel: rejected a red-line gate click: ${refusal}`)
+        return { toast: toast('error', TOAST.notApprover) }
+      }
+    }
+    pendingGates.delete(gate.correlationId)
+    const decidedBy = evt.operator.name ?? evt.operator.openId
+    const red = gate.tier === 'red'
+    if (gate.decision === 'cancel') {
+      audit.record(
+        { kind: 'inbound', senderId: pending.msg.senderId, chatId: pending.msg.chatId, tier: gate.tier, action: red ? 'rejected' : 'cancelled', pattern: pending.pattern, length: pending.msg.content.length },
+        red,
+      )
+      return {
+        toast: toast('info', TOAST.rejected),
+        card: { type: 'raw', data: settledGateCard({ tier: gate.tier, decision: 'cancel', decidedBy }) },
+      }
+    }
+    // 放行：写审计，黄区记确认（去重窗口内不再提醒），消息继续交给 Agent。
+    audit.record(
+      { kind: 'inbound', senderId: pending.msg.senderId, chatId: pending.msg.chatId, tier: gate.tier, action: red ? 'approved' : 'confirmed', pattern: pending.pattern, decidedBy, length: pending.msg.content.length },
+      red,
+    )
+    if (gate.tier === 'yellow') reminders.markConfirmed(pending.key, pending.pattern ?? '', Date.now())
+    void deliver(pending.msg).catch((error: unknown) => {
+      notify(`lark-channel: gated message delivery failed in ${pending.msg.chatId}: ${String(error)}`)
+      void port
+        .send(pending.msg.chatId, { text: `⚠️ 消息处理失败：${error instanceof Error ? error.message : String(error)}` })
+        .catch(reportSendFailure)
+    })
+    return {
+      toast: toast('success', TOAST.allowed),
+      card: { type: 'raw', data: settledGateCard({ tier: gate.tier, decision: 'confirm', decidedBy }) },
+    }
+  }
+
+  /**
+   * Apply one model pick and hand back the repainted picker.
+   *
+   * The switch runs the same steps the typed `/model use` runs — record, then
+   * release so the next message resumes on the new route — because a click and
+   * a typed line must not leave the conversation in two different states.
+   * @param pick - the payload the pressed row carried.
+   * @param evt - the click, for authorization and the operator log.
+   * @returns the toast and the card to paint over the pressed one.
+   */
+  const switchModel = async (
+    pick: ModelActionValue,
+    evt: CardActionEvent,
+  ): Promise<CardActionResponse> => {
+    const refusal = refuseControlClick(pick, evt)
+    if (refusal !== undefined) {
+      notify(`lark-channel: rejected a model switch: ${refusal}`)
+      return { toast: toast('error', TOAST.notYours) }
+    }
+    const route = pick.route === undefined ? undefined : parseRoute(pick.route)
+    if (pick.route !== undefined && route === undefined) {
+      notify(`lark-channel: a model card carried an unreadable route: ${pick.route}`)
+      return { toast: toast('error', TOAST.modelUnreadable) }
+    }
+    // 模型路由锁定（手册 10.3）：卡片切换同样受控，非审批人点击拒绝并留痕。
+    if (config.lockModel) {
+      const approver = authorization.approvers.size > 0 && authorization.approvers.has(evt.operator.openId)
+      if (!approver) {
+        audit.record({ kind: 'model', chatId: pick.chatId, from: 'any', to: pick.route ?? 'default', action: 'blocked' }, true)
+        notify(`lark-channel: blocked a model switch by non-approver ${evt.operator.openId}`)
+        return { toast: toast('error', TOAST.notApprover) }
+      }
+    }
+    const release = releaseFor(pick.key)
+    const result = route === undefined
+      ? await chatModels.reset(pick.key)
+      : await chatModels.set(pick.key, route)
+    if (result.changed) await release()
+    const painted = modelPickerCard(pick, await modelCatalog(), chatModels.routeFor(pick.key), deploymentRoute())
+    return {
+      toast: toast(
+        result.changed ? 'success' : 'info',
+        !result.changed ? TOAST.modelUnchanged : route === undefined ? TOAST.modelReset : TOAST.modelSwitched,
+      ),
+      card: { type: 'raw', data: painted },
+    }
+  }
+
+  /**
+   * Settle one approval from its card's buttons.
+   * @param value - the payload the pressed button carried.
+   * @param evt - the click, for authorization and the decider's name.
+   * @returns the toast and the settled card to paint over the live one.
+   */
+  const decideApproval = (value: ApprovalActionValue, evt: CardActionEvent): CardActionResponse => {
+    const pending = pendingApprovals.get(value.id)
+    // Only an OPEN question takes a click: `sending` has no real card yet (a
+    // click claiming otherwise is forged or duplicated), and `settled` is
+    // merely waiting for its card to be painted.
+    if (pending === undefined || pending.state !== 'open') {
+      return { toast: toast('info', TOAST.approvalGone) }
+    }
+    // Anyone who can see the card can press its button — a group may hold
+    // people who are not authorized to run anything here, and one press grants
+    // the escalation. The decision counts only from an authorized human, in
+    // the chat this card was published to.
+    const clickRefusal = refuseApprovalClick(
+      authorization,
+      { operatorId: evt.operator.openId, chatId: evt.chatId },
+      pending,
+    )
+    if (clickRefusal !== undefined) {
+      notify(`lark-channel: rejected an approval click: ${clickRefusal}`)
+      return { toast: toast('error', TOAST.notApprover) }
+    }
+    const outcome: HostApprovalOutcome = value.decision === 'allow' ? 'allowed-once' : 'rejected'
+    const decidedBy = evt.operator.name ?? evt.operator.openId
+    const toolName = pending.toolName
+    if (!settleApproval(value.id, outcome, decidedBy, false)) {
+      return { toast: toast('info', TOAST.approvalGone) }
+    }
+    return {
+      toast: value.decision === 'allow' ? toast('success', TOAST.allowed) : toast('info', TOAST.rejected),
+      // The decided card rides the click's own response. The patch API this
+      // otherwise relies on reports refusals in a body the SDK discards, so a
+      // failed repaint is invisible — a card left showing live buttons after
+      // its decision is worse than any toast.
+      card: { type: 'raw', data: settledCard(toolName, outcome, decidedBy) },
+    }
+  }
+
+  // Inbound events. Registered before connect so no early event is dropped.
+  //
+  // The handler's promise is returned to the transport, never voided: the SDK
+  // serializes delivery per chat by awaiting it, so voiding the promise was
+  // discarding that guarantee — intake for a chat's messages (acquire, image
+  // downloads, workspace/model switches) could interleave freely. Serialized
+  // intake covers up to `followup()` returning; the turn itself still runs in
+  // the background, which is why reply targets bind to turns, not to arrival.
+  ctx.effect(() => port.on('message', handleMessage), 'lark:on(message)')
+  ctx.effect(() => port.on('cardAction', handleCardAction), 'lark:on(cardAction)')
+
+  // Observability. Without these, the failure modes an operator actually hits —
+  // "the bot ignored me", "an inbound handler threw", "the connection dropped" —
+  // leave no trace at all, because the transport reports each only as an event.
+  ctx.effect(() => port.on('reject', (evt: RejectEvent) => {
+    // A missing mention in a group is the configured steady state, not an
+    // incident, so it stays off the operator console it would flood.
+    if (evt.reason === 'no_mention') {
+      ctx.logger.debug('rejected %s in %s: %s', evt.messageId, evt.chatId, evt.reason)
+      return
+    }
+    ctx.logger.info('rejected %s in %s from %s: %s', evt.messageId, evt.chatId, evt.senderId, evt.reason)
+    // A tripped loop guard means the bot went quiet on purpose; an operator who
+    // does not know that reads it as a hang.
+    if (evt.reason === 'bot_loop') {
+      notify(`lark-channel: bot loop guard tripped in chat ${evt.chatId} — traffic from bots is being refused`)
+    }
+  }), 'lark:on(reject)')
+
+  ctx.effect(() => port.on('error', (error: LarkChannelError) => {
+    notify(`lark-channel: transport error [${error.code}]: ${error.message}`)
+    ctx.logger.warn('transport error [%s]: %s', error.code, error.message)
+  }), 'lark:on(error)')
+
+  // A gap in the long connection is a gap in delivery: the transport has no
+  // replay and no cursor, so events arriving while it is down are simply lost.
+  //
+  // The SDK's reconnect promise is supervised rather than trusted: its
+  // recovery loop has terminal states (verified give-up paths, and a hang
+  // that schedules nothing at all), and a bot whose job is to be reachable
+  // owns its own liveness. Rebuilding goes through the transport's public
+  // lifecycle, which the SDK documents as clearing terminal state.
+  const watchdog = createReconnectWatchdog({
+    deadlineMs: liveness?.deadlineMs ?? RECONNECT_DEADLINE_MS,
+    backoffMs: liveness?.backoffMs ?? RECONNECT_BACKOFF_MS,
+    quota: createAttemptQuota({
+      windowMs: liveness?.quotaWindowMs ?? RECONNECT_QUOTA_WINDOW_MS,
+      limit: liveness?.quotaLimit ?? RECONNECT_QUOTA_LIMIT,
+    }),
+    status: () => port.getConnectionStatus?.()?.state,
+    rebuild: async () => {
+      await port.disconnect().catch(() => {})
+      await port.connect()
+    },
+    report: notify,
+  })
+  ctx.effect(() => () => { watchdog.dispose() }, 'lark:watchdog')
+
+  ctx.effect(() => port.on('reconnecting', () => {
+    watchdog.onReconnecting()
+    notify('lark-channel: connection lost, reconnecting — events arriving now are not replayed')
+    ctx.logger.warn('connection lost, reconnecting')
+  }), 'lark:on(reconnecting)')
+
+  ctx.effect(() => port.on('reconnected', () => {
+    watchdog.onReconnected()
+    notify('lark-channel: connection restored')
+    ctx.logger.info('connection restored')
+  }), 'lark:on(reconnected)')
+
+  // Outbound: the owned chat's renderer decides what reaches the chat. The
+  // bridge additionally remembers each call's arguments for the approval card,
+  // and forgets the turn's calls once it closes.
+  ctx.on('session/event', (session, event: HostSessionEvent) => {
+    const binding = bySession.get(session.id)
+    if (binding === undefined) return
+    if (isTurnStartEvent(event)) {
+      // Fail closed: a turn that never names one of our messages sends its
+      // answer unaimed to the chat. Guessing — reusing the previous target —
+      // is how an injected turn's output lands on an unrelated thread.
+      binding.renderer.aim(undefined)
+    } else if (isUserMessageEvent(event)) {
+      const target = event.data.id === undefined ? undefined : targetByMessageId.get(event.data.id)
+      if (target !== undefined && event.data.id !== undefined) {
+        targetByMessageId.delete(event.data.id)
+        binding.renderer.aim(target)
+      }
+    } else if (isToolCallEvent(event)) {
+      let calls = callSnapshots.get(session.id)
+      if (calls === undefined) {
+        calls = new Map()
+        callSnapshots.set(session.id, calls)
+      }
+      calls.set(event.data.callId, { turn: event.data.turn, arguments: event.data.arguments })
+    } else if (isTurnEndEvent(event)) {
+      // Only THIS session's THIS turn: call ids are known unique per turn, so
+      // keeping exactly the live turn's entries is what makes an id lookup
+      // unambiguous — and other sessions' in-flight turns are none of ours.
+      const calls = callSnapshots.get(session.id)
+      if (calls !== undefined) {
+        for (const [callId, record] of calls) {
+          if (record.turn === event.data.turn) calls.delete(callId)
+        }
+        if (calls.size === 0) callSnapshots.delete(session.id)
+      }
+      runningBySession.set(session.id, false)
+    } else if (isStepStartEvent(event)) {
+      runningBySession.set(session.id, true)
+    }
+    binding.renderer.handle(event)
+    // AFTER the renderer: the turn's own closing output (the answer, a failure
+    // line) still deserves its target; only what comes later must not.
+    if (isTurnEndEvent(event)) binding.renderer.aim(undefined)
+  })
+
+  // Approval questions for owned agents become cards; everything else delegates.
+  //
+  // PREPEND is load-bearing. A host answerer may claim every audited request
+  // rather than only the sessions its own clients own — the Web app's BFF does
+  // exactly that, pushing the question to browser clients and never calling
+  // `next()`. Registered in arrival order this plugin would sit behind it (its
+  // rows mount during tree load, this bridge installs after the loader
+  // settles), so a chat-driven approval would surface in a browser nobody is
+  // watching while the chat waits forever. Answering first is correct on the
+  // merits too: the human who typed the request is in the chat, and this
+  // listener still delegates every session it does not own.
+  ctx.on('approval/request', (request, next) => {
+    const binding = bySession.get(request.agent.session.id)
+    if (binding === undefined) return next()
+    const tool = request.toolName
+    // 工具黄区（warnTools，手册 10 章分级）：自动放行 + 一次提醒 + 审计，不打断工作流。
+    if (config.warnTools.includes(tool)) {
+      audit.record({ kind: 'tool', sessionId: request.agent.session.id, tool, tier: 'yellow', action: 'warned' })
+      void port.send(binding.chatId, { text: `⚠️ 已自动放行工具 \`${tool}\`（黄区提醒：请确认其操作符合信息安全要求）。` }).catch(reportSendFailure)
+      return Promise.resolve('allowed-once' as const)
+    }
+    // 工具红区（approvalTools 或宿主标记的工具）：强制审批卡片 + 审计留痕。
+    const red = config.approvalTools.includes(tool)
+    if (red) {
+      audit.record({ kind: 'tool', sessionId: request.agent.session.id, tool, tier: 'red', action: 'pending-approval' }, true)
+    }
+    const settled = askViaCard(binding, request, next)
+    void Promise.resolve(settled).then((outcome: HostApprovalOutcome) => {
+      audit.record(
+        { kind: 'tool', sessionId: request.agent.session.id, tool, tier: red ? 'red' : 'yellow', action: outcome === 'allowed-once' ? 'approved' : outcome === 'rejected' ? 'rejected' : 'cancelled' },
+        red,
+      )
+    })
+    return settled
+  }, { prepend: true })
+
+  // Owned live state unwinds with the fiber: agents down, open questions
+  // closed, open streaming cards settled. The session store owns the agents, so
+  // it does the disposing — and it leaves an adopted one running for its owner.
+  ctx.effect(() => () => {
+    unwound = true
+    for (const id of [...pendingApprovals.keys()]) settleApproval(id, 'cancelled')
+    pendingApprovals.clear()
+    pendingGates.clear()
+    for (const sessionId of [...bySession.keys()]) questions.cancelSession(sessionId)
+    const open = [...bySession.values()]
+    bySession.clear()
+    bindings.clear()
+    compositions.clear()
+    callSnapshots.clear()
+    runningBySession.clear()
+    audit.close()
+    return Promise.allSettled([
+      sessions.close(),
+      ...open.map((binding) => binding.renderer.close()),
+    ]).then(() => undefined)
+  }, 'lark:agents')
+
+  // Registered last so disposal disconnects the transport first.
+  ctx.effect(() => {
+    port.connect().catch((error: unknown) => {
+      notify(`lark-channel: connect failed: ${error instanceof Error ? error.message : String(error)}`)
+      ctx.logger.error('lark channel connect failed: %s', error)
+    })
+    return () => port.disconnect().catch(reportSendFailure)
+  }, 'lark:connect')
+}

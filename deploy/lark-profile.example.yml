@@ -1,0 +1,48 @@
+# 部署示例：lark profile 安全基线（脱敏模板，勿直接使用真实 open_id）
+# 放到 $DSH_HOME/profiles/<name>/cordis.patch.yml
+# 注意：bundle 层已包含 lark-channel，这里用 id-targeted config 覆盖（不要 insert 同名行，会重复加载报错）。
+
+- id: lark-channel
+  config:
+    # ── 凭据（受管服务注入环境变量；不进任何配置文件明文）──
+    appId: !!js process.env.LARK_APP_ID
+    appSecret: !!js process.env.LARK_APP_SECRET
+
+    # ── 会话与输出 ──
+    requireMention: true          # 群里必须 @ 才响应
+    attachImages: false           # 纯文本模型时图片不进 Agent
+    sessionScope: chat-thread     # 每个话题独立会话，上下文隔离
+    output: cot                   # 原生思考过程（旧客户端可改 stream）
+
+    # ── 访问边界（替换为实际 open_id / chat_id）──
+    senderAllowlist:
+      - ou_<你的_open_id>
+    # groupAllowlist:
+    #   - oc_<允许的群>
+    workspaceRoots:
+      - C:\path\to\workspace       # /cd 只能在此目录前缀内切换
+
+    # ── 审批框架 ──
+    # approvers: [ou_<审批人>]     # 回填后 onRed 改 approval 即启用红区审批
+    onRed: block                  # block（拦截+留痕）| approval（转审批人+留痕）
+    onYellow: remind              # remind（提醒确认后继续）| off
+    remindDedupeMinutes: 5        # 同会话同特征 5 分钟内不重复提醒
+
+    # ── 模型路由（手册 10.3：优先受控工具）──
+    # provider: deepseek
+    # model: deepseek-chat
+    # lockModel: false            # true 后 /model 切换需审批人（approvers 为空时完全锁定）
+
+    # ── 工具分级 ──
+    # warnTools: []               # 黄区：自动放行+一次提醒（如写文件类）
+    # approvalTools: []           # 红区：强制审批卡片+审计（如删除/外发类）
+
+    # ── 审计留痕（红区强制，不受开关影响）──
+    # auditEnabled: true
+    # auditLogFile: ''
+    # auditRecordGreen: false
+    # auditStripPii: true
+
+    # ── 分级特征（默认种子在 src/config.ts，按公司手册调优）──
+    # yellowPatterns: [采购底价, 'BOM\s*表', 源代码, 客户名单]
+    # redPatterns: ['\b1[3-9]\d{9}\b', '\b\d{17}[\dXx]\b', '\b\d{16,19}\b', '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b']
