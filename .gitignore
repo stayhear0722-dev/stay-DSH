@@ -5,6 +5,17 @@ node_modules/
 coverage/
 .pnpm-store/
 
+# Local credentials and runtime records
+.env
+.env.*
+!.env.example
+logs/
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Editor and OS metadata
 .idea/
 .DS_Store

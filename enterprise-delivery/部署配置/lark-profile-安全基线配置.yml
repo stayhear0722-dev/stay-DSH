@@ -1,0 +1,52 @@
+# 企业信息安全合规部署 · 安全基线配置框架
+# 三级分级管控：绿区零打扰 / 黄区提醒 / 红区留痕（手册第 10 章）
+# 本文件为「框架版」：approvers 先留空（红区走 block），待信息安全部授权后回填即启用审批模式。
+# 注意：bundle 层已包含 lark-channel，这里用 id-targeted config 覆盖（不要 insert 同名行，会重复）。
+
+- id: lark-channel
+  config:
+    # ── 凭据（受管服务注入环境变量；不进任何配置文件明文）──
+    appId: !!js process.env.LARK_APP_ID
+    appSecret: !!js process.env.LARK_APP_SECRET
+
+    # ── 会话与输出 ──
+    requireMention: true          # 群里必须 @ 才响应
+    attachImages: false           # 当前为纯文本模型，图片不进 Agent
+    sessionScope: chat-thread     # 每个话题独立会话，上下文隔离
+    output: cot                   # 原生思考过程（旧客户端可改 stream）
+    showProcess: true
+
+    # ── 访问边界（小职员自用：先只放自己；可加同事/群）──
+    # 示例安全管理员 open_id：ou_example_security_admin
+    # 示例应用注册账号：ou_example_security_auditor
+    senderAllowlist:
+      - ou_example_platform_admin
+      - ou_example_incident_responder
+    # groupAllowlist: []          # 允许的群 chat_id，例如 oc_xxxx
+    workspaceRoots:
+      - C:\Path\To\ApprovedWorkspace   # /cd 只能在此目录前缀内切换
+
+    # ── 审批框架（先留空；红区默认 block，不需要审批人）──
+    # approvers: []               # 回填 open_id 后，onRed 改 approval 即启用红区审批
+    onRed: block                  # block（拦截+留痕）| approval（转审批人+留痕）
+    onYellow: remind              # remind（提醒确认后继续）| off
+    remindDedupeMinutes: 5        # 同会话同特征 5 分钟内不重复提醒
+
+    # ── 模型路由（手册 10.3：优先受控工具）──
+    # provider: deepseek          # 固定经审批的模型；如已配置宿主默认可留空
+    # model: deepseek-chat
+    # lockModel: false            # 建议开启：true 后 /model 切换需审批人（approvers 为空时完全锁定）
+
+    # ── 工具分级 ──
+    # warnTools: []               # 黄区：自动放行+一次提醒（如写文件类）
+    # approvalTools: []           # 红区：强制审批卡片+审计（如删除/外发类）
+
+    # ── 审计留痕（红区强制，不受开关影响）──
+    # auditEnabled: true
+    # auditLogFile: ''            # 缺省 $DSH_HOME/logs/lark-audit.jsonl
+    # auditRecordGreen: false     # 绿区默认不记录（零打扰）
+    # auditStripPii: true         # 落盘前剥离手机号/身份证/邮箱等 PII
+
+    # ── 分级特征（默认种子在 config.ts，可按手册调优）──
+    # yellowPatterns: [采购底价, 'BOM\s*表', 源代码, 客户名单]
+    # redPatterns: ['\b1[3-9]\d{9}\b', '\b\d{17}[\dXx]\b', '\b\d{16,19}\b', '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b']
